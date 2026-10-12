@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: cdss-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cdss
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cdss"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cdss-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # GPU support (optional, commented out by default so it runs on all hosts)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  ollama-model-pull:
+    image: curlimages/curl:latest
+    container_name: cdss-ollama-pull
+    depends_on:
+      - ollama
+    entrypoint: >
+      sh -c "
+      echo 'Waiting for Ollama service to start...';
+      until curl -s http://ollama:11434/api/tags > /dev/null; do sleep 3; done;
+      echo 'Ollama service is up!';
+      if curl -s http://ollama:11434/api/tags | grep -q 'llama3'; then
+        echo 'Llama 3 model already exists. Skipping pull.';
+      else
+        echo 'Pulling Llama 3 instruct model... This will take a few minutes depending on connection.';
+        curl -s -X POST http://ollama:11434/api/pull -d '{\"name\": \"llama3:8b-instruct-q4_K_M\"}';
+        echo 'Model pull completed!';
+      fi
+      "
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cdss-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/cdss
+      - OLLAMA_HOST=http://ollama:11434
+      - CHROMA_PERSIST_DIR=/app/chroma_db
+    depends_on:
+      db:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    volumes:
+      - chroma_data:/app/chroma_db
+    command: >
+      sh -c "
+      echo 'Waiting for database...';
+      sleep 3;
+      echo 'Running database setup...';
+      python -m backend.app.db.seeds.seed_symptoms;
+      python -m backend.app.ml.train_models;
+      python -m backend.app.rag.kb_ingest;
+      echo 'Starting FastAPI application...';
+      uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+      "
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cdss-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  ollama_data:
+  chroma_data:
